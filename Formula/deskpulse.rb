@@ -1,7 +1,8 @@
 class Deskpulse < Formula
   desc "Work-presence helper agent for macOS"
   homepage "https://github.com/aresukio/homebrew-deskpulse"
-  url "https://github.com/aresukio/homebrew-deskpulse/releases/download/24/deskpulse-macos-arm64.tar.gz"
+  url "https://github.com/aresukio/homebrew-deskpulse/releases/download/24/deskpulse-24-macos-arm64.tar.gz"
+  version "24"
   sha256 "2fd0159aefbb5d1f0d996aab290e7df718cebe8b58875900c53c4a66ecda3973"
   license "MIT"
 
