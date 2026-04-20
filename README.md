@@ -5,10 +5,17 @@ DeskPulse is a macOS background agent that keeps your session active based on co
 ## Install (First time)
 
 ```bash
-brew tap aresukio/deskpulse https://github.com/aresukio/deskpulse
+brew tap aresukio/deskpulse
 brew install aresukio/deskpulse/deskpulse
 
 deskpulse up
+
+// At this stage the binary will have to be allowed under 
+1) Open System Settings -> Privacy & Security -> Accessibility 
+2) Enable deskpulse-agent
+
+Run `deskpulse up` again until it doesn't show any error.
+
 ```
 
 Trust will have to be granted, follow **Accessibility Permission (Required)**.
