@@ -8,17 +8,14 @@ DeskPulse is a macOS background agent that keeps your session active based on co
 brew tap aresukio/deskpulse
 brew install aresukio/deskpulse/deskpulse
 
-deskpulse up
+deskpulse up // to trigger permission
 
-// At this stage the binary will have to be allowed under 
-1) Open System Settings -> Privacy & Security -> Accessibility 
-2) Enable deskpulse-agent
+// 1) Open System Settings -> Privacy & Security -> Accessibility 
+// 2) Enable deskpulse-agent
 
-Run `deskpulse up` again until it doesn't show any error.
+deskpulse up // again
 
 ```
-
-Trust will have to be granted, follow **Accessibility Permission (Required)**.
 
 ## Accessibility Permission (Required)
 
@@ -31,9 +28,13 @@ Trust will have to be granted, follow **Accessibility Permission (Required)**.
 
 ```bash
 deskpulse update
-```
 
-Every new version will require trust to be granted again, follow **Accessibility Permission (Required)**.
+// Every new version will require trust to be granted again
+// 1) Open System Settings -> Privacy & Security -> Accessibility 
+// 2) Enable the newly aded deskpulse-agent
+
+deskpulse up // again
+```
 
 ## Useful commands
 
@@ -41,5 +42,4 @@ Every new version will require trust to be granted again, follow **Accessibility
 deskpulse help
 deskpulse status
 deskpulse logs
-deskpulse update
 ```
