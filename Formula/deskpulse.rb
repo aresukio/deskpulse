@@ -16,7 +16,6 @@ class Deskpulse < Formula
   service do
     run [opt_bin/"deskpulse-agent"]
     keep_alive true
-    working_dir var/"deskpulse"
     log_path var/"log/deskpulse-out.txt"
     error_log_path var/"log/deskpulse-err.txt"
     environment_variables(
