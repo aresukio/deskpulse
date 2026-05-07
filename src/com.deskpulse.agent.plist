@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.deskpulse.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/swift</string>
+        <string>~/Library/.DeskPulse/DeskPulseAgent.swift</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>~/Library/.DeskPulse</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/deskpulse-out.txt</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/deskpulse-err.txt</string>
+</dict>
+</plist>

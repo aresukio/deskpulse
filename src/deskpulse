@@ -1,0 +1,676 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+DEFAULT_LABEL="com.deskpulse.agent"
+HOMEBREW_LABEL="homebrew.mxcl.deskpulse"
+LABEL="${DESKPULSE_LAUNCH_LABEL:-${DEFAULT_LABEL}}"
+LAUNCH_DOMAIN="gui/$(id -u)"
+DEFAULT_CONFIG_PATH="${HOME}/Library/Application Support/DeskPulse/config.json"
+CONFIG_PATH="${DESKPULSE_CONFIG_PATH:-${MONITORSERVICE_CONFIG_PATH:-${DEFAULT_CONFIG_PATH}}}"
+CONFIG_DIR="$(dirname "${CONFIG_PATH}")"
+PERMISSION_STATUS_PATH="${DESKPULSE_PERMISSION_STATUS_PATH:-${CONFIG_DIR}/permission-status.txt}"
+OUT_LOG_PATH="${DESKPULSE_OUT_LOG_PATH:-/tmp/deskpulse-out.txt}"
+ERR_LOG_PATH="${DESKPULSE_ERR_LOG_PATH:-/tmp/deskpulse-err.txt}"
+SERVICE_PLIST_PATH="${DESKPULSE_SERVICE_PLIST_PATH:-}"
+
+export CONFIG_KEY_CONNECTED_WIFI_ENABLED="wifiFilterEnabled"
+export CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS="wifiFilter"
+export CONFIG_KEY_OUTSIDE_HOURS_ENABLED="activeHoursEnabled"
+export CONFIG_KEY_OUTSIDE_HOURS_RANGE="activeHours"
+
+export STORAGE_KEY_SSID_PRESENT_ENABLED="disableIfSSIDPresentEnabled"
+export STORAGE_KEY_SSID_PRESENT_LIST="disableIfSSIDPresentList"
+export STORAGE_KEY_WIFI_SCAN_INTERVAL="wifiScanIntervalSeconds"
+export STORAGE_KEY_OUTSIDE_HOURS_ENABLED="disableIfOutsideHoursEnabled"
+export STORAGE_KEY_OUTSIDE_HOURS_RANGE="disableIfOutsideHoursRange"
+
+candidate_labels() {
+    if [[ -n "${DESKPULSE_LAUNCH_LABEL:-}" ]]; then
+        printf '%s\n' "${DESKPULSE_LAUNCH_LABEL}"
+        return
+    fi
+    printf '%s\n' "${DEFAULT_LABEL}"
+    printf '%s\n' "${HOMEBREW_LABEL}"
+}
+
+resolve_launch_job_ref() {
+    local label
+    while IFS= read -r label; do
+        local job_ref="${LAUNCH_DOMAIN}/${label}"
+        if launchctl print "${job_ref}" >/dev/null 2>&1; then
+            printf '%s\n' "${job_ref}"
+            return 0
+        fi
+    done < <(candidate_labels)
+
+    # Fallback to explicitly configured/default label when no loaded job is found.
+    printf '%s\n' "${LAUNCH_DOMAIN}/${LABEL}"
+}
+
+default_config_json() {
+    cat <<EOF
+{
+  "idleThresholdSeconds": 5,
+  "loopIntervalSeconds": 1,
+  "pixelOffset": 2,
+  "${STORAGE_KEY_SSID_PRESENT_ENABLED}": false,
+  "${STORAGE_KEY_SSID_PRESENT_LIST}": [],
+  "${STORAGE_KEY_WIFI_SCAN_INTERVAL}": 60,
+  "${STORAGE_KEY_OUTSIDE_HOURS_ENABLED}": true,
+  "${STORAGE_KEY_OUTSIDE_HOURS_RANGE}": "8-17"
+}
+EOF
+}
+
+ensure_config_exists() {
+    mkdir -p "${CONFIG_DIR}"
+    if [[ -f "${CONFIG_PATH}" ]]; then
+        return
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp "${CONFIG_DIR}/config.json.tmp.XXXXXX")"
+    default_config_json > "${tmp_file}"
+    mv "${tmp_file}" "${CONFIG_PATH}"
+}
+
+run_python_update() {
+    local py_code="$1"
+    shift
+    python3 - "$CONFIG_PATH" "$py_code" "$@" <<'PYCODE'
+import json
+import os
+import sys
+from tempfile import NamedTemporaryFile
+
+config_path = sys.argv[1]
+update_code = sys.argv[2]
+args = sys.argv[3:]
+
+config = {}
+if os.path.exists(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if isinstance(loaded, dict):
+        config = loaded
+
+exec(update_code, {"config": config, "args": args})
+
+os.makedirs(os.path.dirname(config_path), exist_ok=True)
+with NamedTemporaryFile("w", delete=False, dir=os.path.dirname(config_path), encoding="utf-8") as tmp:
+    json.dump(config, tmp, indent=2)
+    tmp.write("\n")
+    tmp_path = tmp.name
+os.replace(tmp_path, config_path)
+PYCODE
+}
+
+normalize_bool() {
+    local value
+    value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "${value}" in
+        true|1|yes|on) echo "true" ;;
+        false|0|no|off) echo "false" ;;
+        *)
+            echo "Invalid boolean value: ${1}" >&2
+            echo "Expected one of: true/false, 1/0, yes/no, on/off" >&2
+            exit 1
+            ;;
+    esac
+}
+
+config_storage_key() {
+    case "$1" in
+        "${CONFIG_KEY_CONNECTED_WIFI_ENABLED}") echo "${STORAGE_KEY_SSID_PRESENT_ENABLED}" ;;
+        "${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS}") echo "${STORAGE_KEY_SSID_PRESENT_LIST}" ;;
+        "${CONFIG_KEY_OUTSIDE_HOURS_ENABLED}") echo "${STORAGE_KEY_OUTSIDE_HOURS_ENABLED}" ;;
+        "${CONFIG_KEY_OUTSIDE_HOURS_RANGE}") echo "${STORAGE_KEY_OUTSIDE_HOURS_RANGE}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+print_trust_instructions() {
+    cat <<'EOF'
+ERROR: Accessibility trust is not granted for DeskPulse.
+
+To fix:
+  1) Open System Settings -> Privacy & Security -> Accessibility
+  2) Enable deskpulse-agent
+  3) Run: deskpulse up
+EOF
+}
+
+set_permission_status_pending() {
+    mkdir -p "$(dirname "${PERMISSION_STATUS_PATH}")"
+    : > "${PERMISSION_STATUS_PATH}"
+}
+
+read_permission_status() {
+    if [[ ! -f "${PERMISSION_STATUS_PATH}" ]]; then
+        printf 'empty\n'
+        return 0
+    fi
+
+    local state
+    state="$(tr -d '[:space:]' < "${PERMISSION_STATUS_PATH}")"
+    case "${state}" in
+        true|false)
+            printf '%s\n' "${state}"
+            ;;
+        *)
+            printf 'empty\n'
+            ;;
+    esac
+}
+
+wait_for_permission_status() {
+    local timeout_seconds="${1:-12}"
+    local elapsed=0
+
+    while (( elapsed < timeout_seconds )); do
+        local result
+        result="$(read_permission_status)"
+
+        case "${result}" in
+            true|false)
+                printf '%s\n' "${result}"
+                return 0
+                ;;
+        esac
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    printf 'timeout\n'
+}
+
+wait_for_service_pid() {
+    local job_ref
+    job_ref="$(resolve_launch_job_ref)"
+    local launch_output
+    local pid
+    local attempt
+
+    # Launchd can take a moment to reflect the post-restart state.
+    for attempt in 1 2 3 4 5; do
+        launch_output="$(launchctl print "${job_ref}" 2>/dev/null || true)"
+        pid="$(printf '%s\n' "${launch_output}" | rg "^\s*pid = " | sed -E 's/.*pid = ([0-9]+).*/\1/' || true)"
+
+        if [[ -n "${pid}" ]]; then
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    return 1
+}
+
+set_key() {
+    local key="$1"
+    local value="$2"
+
+    ensure_config_exists
+    local storage_key
+    storage_key="$(config_storage_key "${key}")"
+
+    case "${key}" in
+        idleThresholdSeconds)
+            if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                echo "idleThresholdSeconds must be a positive number." >&2
+                exit 1
+            fi
+            run_python_update 'config["idleThresholdSeconds"] = float(args[0])' "${value}"
+            ;;
+        pixelOffset)
+            if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                echo "pixelOffset must be a positive number." >&2
+                exit 1
+            fi
+            run_python_update 'config["pixelOffset"] = float(args[0])' "${value}"
+            ;;
+        "${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS}")
+            local action="add"
+            local fragment="${value}"
+            # Case-insensitive add/remove prefix (macOS ships Bash 3.2 — no ${var,,}).
+            if [[ "${value}" =~ ^[[:space:]]*([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+                local kw="${BASH_REMATCH[1]}"
+                local rest="${BASH_REMATCH[3]}"
+                local kw_lower
+                kw_lower="$(printf '%s' "${kw}" | tr '[:upper:]' '[:lower:]')"
+                if [[ -n "${rest}" ]] && { [[ "${kw_lower}" == "add" ]] || [[ "${kw_lower}" == "remove" ]]; }; then
+                    action="${kw_lower}"
+                    fragment="${rest}"
+                fi
+            fi
+            if [[ "${fragment}" == *,* ]]; then
+                echo "${key} accepts a single substring per call (matched against the connected Wi-Fi name)." >&2
+                exit 1
+            fi
+            if [[ "${action}" == "remove" ]]; then
+                run_python_update \
+                'fragment = args[0].strip()
+if not fragment:
+    raise SystemExit("Substring must not be empty.")
+storage_key = args[1]
+filters = list(config.get(storage_key) or [])
+config[storage_key] = [entry for entry in filters if entry != fragment]' \
+                "${fragment}" "${storage_key}"
+            else
+                run_python_update \
+                'fragment = args[0].strip()
+if not fragment:
+    raise SystemExit("Substring must not be empty.")
+storage_key = args[1]
+filters = list(config.get(storage_key) or [])
+if fragment not in filters:
+    filters.append(fragment)
+config[storage_key] = filters' \
+                "${fragment}" "${storage_key}"
+            fi
+            ;;
+        "${CONFIG_KEY_CONNECTED_WIFI_ENABLED}")
+            local parsed
+            parsed="$(normalize_bool "${value}")"
+            run_python_update \
+                'config[args[1]] = (args[0] == "true")' \
+                "${parsed}" "${storage_key}"
+            ;;
+        "${STORAGE_KEY_WIFI_SCAN_INTERVAL}")
+            if [[ ! "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -lt 1 ]]; then
+                echo "Value must be a positive integer (seconds)." >&2
+                exit 1
+            fi
+            run_python_update 'config[args[1]] = int(args[0])' "${value}" "${storage_key}"
+            ;;
+        "${CONFIG_KEY_OUTSIDE_HOURS_ENABLED}")
+            local parsed
+            parsed="$(normalize_bool "${value}")"
+            run_python_update \
+                'config[args[1]] = (args[0] == "true")' \
+                "${parsed}" "${storage_key}"
+            ;;
+        "${CONFIG_KEY_OUTSIDE_HOURS_RANGE}")
+            if [[ ! "${value}" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+                echo "Invalid ${key} format: ${value}" >&2
+                echo "Expected: <startHour-endHour>, e.g. 8-17" >&2
+                exit 1
+            fi
+            local start_hour="${BASH_REMATCH[1]}"
+            local end_hour="${BASH_REMATCH[2]}"
+            if (( start_hour < 0 || start_hour > 23 || end_hour < 0 || end_hour > 23 )); then
+                echo "Hours must be in the range 0-23." >&2
+                exit 1
+            fi
+            run_python_update 'config[args[1]] = args[0]' "${value}" "${storage_key}"
+            ;;
+        *)
+            echo "Unknown key: ${key}" >&2
+            echo "Run 'deskpulse help' to see supported keys." >&2
+            exit 1
+            ;;
+    esac
+
+    echo "Updated ${key}."
+    up_service
+}
+
+show_config() {
+    ensure_config_exists
+    python3 - "${CONFIG_PATH}" <<'PYCODE'
+import json
+import os
+import sys
+
+# On-disk legacy keys -> user-facing labels (same as deskpulse help / CLI).
+DISPLAY_KEY_MAP = {
+    os.environ["STORAGE_KEY_SSID_PRESENT_ENABLED"]: os.environ["CONFIG_KEY_CONNECTED_WIFI_ENABLED"],
+    os.environ["STORAGE_KEY_SSID_PRESENT_LIST"]: os.environ["CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS"],
+    os.environ["STORAGE_KEY_OUTSIDE_HOURS_ENABLED"]: os.environ["CONFIG_KEY_OUTSIDE_HOURS_ENABLED"],
+    os.environ["STORAGE_KEY_OUTSIDE_HOURS_RANGE"]: os.environ["CONFIG_KEY_OUTSIDE_HOURS_RANGE"],
+}
+
+HIDDEN_KEYS = [
+    "loopIntervalSeconds",
+    "movementTolerancePixels",
+    os.environ["STORAGE_KEY_WIFI_SCAN_INTERVAL"],
+]
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+if not isinstance(data, dict):
+    data = {}
+
+display = dict(data)
+for key in HIDDEN_KEYS:
+    display.pop(key, None)
+
+for storage_key, display_key in DISPLAY_KEY_MAP.items():
+    if storage_key in display:
+        display[display_key] = display.pop(storage_key)
+
+for key, value in display.items():
+    if isinstance(value, (dict, list)):
+        rendered = json.dumps(value)
+    elif isinstance(value, bool):
+        rendered = "true" if value else "false"
+    else:
+        rendered = str(value)
+    print(f"{key}: {rendered}")
+PYCODE
+}
+
+resolve_service_log_path() {
+    local launch_output="$1"
+    local stream="$2"
+    local parsed
+    parsed="$(printf '%s\n' "${launch_output}" | rg "^\\s*${stream} path = " | sed -E "s/.*${stream} path = (.*)/\\1/" || true)"
+    printf '%s\n' "${parsed}"
+}
+
+show_permissions_status() {
+    local job_ref
+    job_ref="$(resolve_launch_job_ref)"
+    local launch_output
+
+    launch_output="$(launchctl print "${job_ref}" 2>/dev/null || true)"
+    if [[ -z "${launch_output}" ]]; then
+        echo "Trust: ERROR (agent is not loaded)"
+        echo "LaunchAgent: not loaded (${job_ref})"
+    else
+        local pid
+        pid="$(printf '%s\n' "${launch_output}" | rg "^\s*pid = " | sed -E 's/.*pid = ([0-9]+).*/\1/' || true)"
+
+        if [[ -n "${pid}" ]]; then
+            set_permission_status_pending
+            local permission_status
+            permission_status="$(wait_for_permission_status 5)"
+            case "${permission_status}" in
+                true)
+                    echo "Trust: Granted"
+                    ;;
+                false)
+                    echo "Trust: ERROR (Accessibility trust is not granted)"
+                    ;;
+                *)
+                    echo "Trust: ERROR (unable to confirm accessibility trust)"
+                    ;;
+            esac
+            echo "LaunchAgent: loaded (${job_ref})"
+        else
+            echo "Trust: ERROR (agent is not running)"
+            echo "LaunchAgent: loaded (${job_ref}), currently not running"
+        fi
+    fi
+}
+
+show_configuration_status() {
+    echo ""
+    echo "Configuration"
+    echo "-------------"
+    show_config
+    echo ""
+    echo "Modify with"
+    echo "deskpulse <key> <value>"
+    echo "or"
+    echo "deskpulse ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS} [add|remove] <ssid_substring>"
+    echo "----"
+}
+
+show_status() {
+    ensure_config_exists
+
+    echo ""
+    show_permissions_status
+    show_configuration_status
+}
+
+restart_agent() {
+    local job_ref
+    job_ref="$(resolve_launch_job_ref)"
+    launchctl kickstart -k "${job_ref}"
+    echo "Restarted ${job_ref}"
+}
+
+is_test_service_mode() {
+    [[ -n "${SERVICE_PLIST_PATH}" ]]
+}
+
+restart_managed_service() {
+    if is_test_service_mode; then
+        local job_ref="${LAUNCH_DOMAIN}/${LABEL}"
+        launchctl bootout "${LAUNCH_DOMAIN}" "${SERVICE_PLIST_PATH}" >/dev/null 2>&1 || true
+        launchctl bootstrap "${LAUNCH_DOMAIN}" "${SERVICE_PLIST_PATH}"
+        launchctl kickstart -k "${job_ref}" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    brew services restart aresukio/deskpulse/deskpulse
+}
+
+stop_managed_service() {
+    if is_test_service_mode; then
+        launchctl bootout "${LAUNCH_DOMAIN}" "${SERVICE_PLIST_PATH}" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    brew services stop aresukio/deskpulse/deskpulse
+}
+
+up_service() {
+    ensure_config_exists
+    local attempt
+    local permission_status="timeout"
+
+    for attempt in 1 2 3; do
+        set_permission_status_pending
+        restart_managed_service
+        permission_status="$(wait_for_permission_status 12)"
+
+        if [[ "${permission_status}" == "true" ]] && wait_for_service_pid; then
+            echo ""
+            show_permissions_status
+            return 0
+        fi
+
+        if (( attempt < 3 )); then
+            echo "Retrying DeskPulse startup (${attempt}/3): permission status=${permission_status}." >&2
+        fi
+    done
+
+    if [[ "${permission_status}" == "false" ]]; then
+        print_trust_instructions
+        exit 1
+    fi
+
+    echo "ERROR: DeskPulse agent did not start successfully." >&2
+    echo "Run 'deskpulse status' and 'deskpulse logs' for details." >&2
+    exit 1
+}
+
+down_service() {
+    stop_managed_service
+
+    local job_ref
+    job_ref="$(resolve_launch_job_ref)"
+    local launch_output
+    local pid
+    local attempt
+
+    # Verify the service is no longer running.
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        launch_output="$(launchctl print "${job_ref}" 2>/dev/null || true)"
+        if [[ -z "${launch_output}" ]]; then
+            return 0
+        fi
+
+        pid="$(printf '%s\n' "${launch_output}" | rg "^\s*pid = " | sed -E 's/.*pid = ([0-9]+).*/\1/' || true)"
+        if [[ -z "${pid}" ]]; then
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    echo "ERROR: DeskPulse service did not stop in time." >&2
+    exit 1
+}
+
+update_and_restart() {
+    if is_test_service_mode; then
+        echo "ERROR: update is not supported for test LaunchAgent mode." >&2
+        exit 1
+    fi
+
+    down_service
+    brew update
+    brew upgrade aresukio/deskpulse/deskpulse
+    up_service
+}
+
+open_logs() {
+    local job_ref
+    job_ref="$(resolve_launch_job_ref)"
+    local launch_output
+    launch_output="$(launchctl print "${job_ref}" 2>/dev/null || true)"
+
+    local out_path
+    local err_path
+    out_path="$(resolve_service_log_path "${launch_output}" "stdout")"
+    err_path="$(resolve_service_log_path "${launch_output}" "stderr")"
+
+    if [[ -z "${out_path}" ]]; then
+        out_path="${OUT_LOG_PATH}"
+    fi
+    if [[ -z "${err_path}" ]]; then
+        err_path="${ERR_LOG_PATH}"
+    fi
+
+    if [[ ! -f "${out_path}" ]]; then
+        touch "${out_path}"
+    fi
+    if [[ ! -f "${err_path}" ]]; then
+        touch "${err_path}"
+    fi
+
+    if open -t "${out_path}" >/dev/null 2>&1; then
+        open -t "${err_path}" >/dev/null 2>&1
+        return
+    fi
+
+    open "${out_path}" >/dev/null 2>&1 || true
+    open "${err_path}" >/dev/null 2>&1 || true
+}
+
+print_help() {
+    cat <<EOF
+deskpulse - Manage DeskPulse agent configuration
+
+USAGE
+  deskpulse help
+  deskpulse status
+  deskpulse logs
+  deskpulse up
+  deskpulse down
+  deskpulse ${CONFIG_KEY_CONNECTED_WIFI_ENABLED} <true|false>
+  deskpulse ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS} [add|remove] <ssid_substring>
+  deskpulse ${CONFIG_KEY_OUTSIDE_HOURS_ENABLED} <true|false>
+  deskpulse ${CONFIG_KEY_OUTSIDE_HOURS_RANGE} <startHour-endHour>
+  deskpulse update
+  deskpulse restart
+
+COMMANDS
+  help
+      Print this help output.
+
+  status
+      Show runtime status of the launch agent (label, PID if running).
+
+  logs
+      Open DeskPulse stdout and stderr log files in default app.
+
+  up
+      Check Accessibility trust and restart the Homebrew DeskPulse service.
+
+  down
+      Stop the Homebrew DeskPulse service.
+
+  idleThresholdSeconds <number>
+      Set idle threshold before nudging.
+
+  pixelOffset <number>
+      Set cursor nudge distance in pixels.
+
+  ${CONFIG_KEY_CONNECTED_WIFI_ENABLED} <true|false>
+      When true, nudging is disabled if the currently **connected** Wi-Fi network name
+      contains any substring from ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS} (not a scan for
+      nearby SSIDs).
+
+  ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS} [add|remove] <ssid_substring>
+      Manage substrings for connected Wi-Fi name filtering.
+
+  ${CONFIG_KEY_OUTSIDE_HOURS_ENABLED} <true|false>
+      Enable or disable outside-hours disabling.
+
+  ${CONFIG_KEY_OUTSIDE_HOURS_RANGE} <startHour-endHour>
+      Set outside-hours range, e.g. 8-17.
+
+  restart
+      Restart the launch agent to apply the latest config.
+
+  update
+      Run brew update, brew upgrade deskpulse, and service restart.
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "${cmd}" in
+    help|--help|-h)
+        print_help
+        ;;
+    status)
+        show_status
+        ;;
+    logs)
+        open_logs
+        ;;
+    up)
+        up_service
+        ;;
+    down)
+        down_service
+        ;;
+    update)
+        update_and_restart
+        ;;
+    restart)
+        restart_agent
+        ;;
+    *)
+        case "${cmd}" in
+            idleThresholdSeconds|pixelOffset|"${CONFIG_KEY_CONNECTED_WIFI_ENABLED}"|"${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS}"|"${STORAGE_KEY_WIFI_SCAN_INTERVAL}"|"${CONFIG_KEY_OUTSIDE_HOURS_ENABLED}"|"${CONFIG_KEY_OUTSIDE_HOURS_RANGE}")
+                if [[ $# -lt 1 ]]; then
+                    echo "Usage: deskpulse ${cmd} <value>" >&2
+                    exit 1
+                fi
+                value="$*"
+                if [[ -z "${value}" ]]; then
+                    echo "Value must not be empty." >&2
+                    exit 1
+                fi
+                set_key "${cmd}" "${value}"
+                ;;
+            *)
+                echo "Unknown command: ${cmd}" >&2
+                echo "" >&2
+                print_help
+                exit 1
+                ;;
+        esac
+        ;;
+esac
