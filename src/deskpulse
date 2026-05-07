@@ -51,7 +51,7 @@ resolve_launch_job_ref() {
 default_config_json() {
     cat <<EOF
 {
-  "idleThresholdSeconds": 5,
+  "idleThresholdSeconds": 60,
   "loopIntervalSeconds": 1,
   "pixelOffset": 2,
   "${STORAGE_KEY_SSID_PRESENT_ENABLED}": false,
