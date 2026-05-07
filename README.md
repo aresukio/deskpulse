@@ -2,6 +2,18 @@
 
 DeskPulse is a macOS background agent that keeps your session active, helping apps avoid switching you to an "Away" status.
 
+## Prerequisits 
+
+- MacOS
+
+- Homebrew
+Install homebrew 
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+More about Homebrew here 
+https://brew.sh/
+
 ## Install (First time)
 
 ```bash
