@@ -1,6 +1,6 @@
 # DeskPulse
 
-DeskPulse is a macOS background agent that keeps your session active based on configurable Wi-Fi and working-hours filters.
+DeskPulse is a macOS background agent that keeps your session active, helping apps avoid switching you to an "Away" status.
 
 ## Install (First time)
 

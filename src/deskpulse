@@ -605,18 +605,16 @@ COMMANDS
       Set cursor nudge distance in pixels.
 
   ${CONFIG_KEY_CONNECTED_WIFI_ENABLED} <true|false>
-      When true, nudging is disabled if the currently **connected** Wi-Fi network name
-      contains any substring from ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS} (not a scan for
-      nearby SSIDs).
+      When true, DeskPulse is disabled if the connected Wi-Fi SSID matches one of the substrings configured under ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS}. Otherwise, DeskPulse remains enabled.
 
   ${CONFIG_KEY_CONNECTED_WIFI_SUBSTRINGS} [add|remove] <ssid_substring>
-      Manage substrings for connected Wi-Fi name filtering.
+      Manage substrings used to match the connected Wi-Fi SSID.
 
   ${CONFIG_KEY_OUTSIDE_HOURS_ENABLED} <true|false>
-      Enable or disable outside-hours disabling.
+      When true, DeskPulse is enabled only during the hours configured under ${CONFIG_KEY_OUTSIDE_HOURS_RANGE}. When false, the hours filter is ignored and DeskPulse can run at any time.
 
   ${CONFIG_KEY_OUTSIDE_HOURS_RANGE} <startHour-endHour>
-      Set outside-hours range, e.g. 8-17.
+      Set the hours during which DeskPulse is enabled. Outside this range, DeskPulse is disabled. For example, 9-17 keeps your session active only between 09:00 and 17:00.
 
   restart
       Restart the launch agent to apply the latest config.
